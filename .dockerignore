@@ -1,0 +1,11 @@
+.venv
+.git
+tests/
+.pytest_cache
+.mypy_cache
+.ruff_cache
+__pycache__
+.coverage
+coverage.xml
+.idea
+models/
