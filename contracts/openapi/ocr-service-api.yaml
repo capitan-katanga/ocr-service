@@ -1,0 +1,518 @@
+openapi: 3.1.0
+info:
+  title: ocr-service API
+  version: 0.2.0
+  summary: Transcripción de comprobantes (imágenes y PDF sin texto confiable). No clasifica ni interpreta.
+  description: |
+    Servicio Python interno (ADR-019). Su único llamador es receipt-parser, por HTTP síncrono dentro del
+    procesamiento del listener de q.ocr-request o del endpoint síncrono del eval. No se conecta a RabbitMQ,
+    no tiene base de datos, no llama a otros servicios ni a modelos remotos y el API Gateway no lo expone.
+
+    **Motores:** hoy uno solo, `paddleocr` (PP-OCRv6, local). `engine`, `EngineRegistry` y GET
+    /api/v1/engines quedan para sumar motores sin cambiar la forma del contrato; un motor nuevo amplía el
+    enum `EngineName` (cambio compatible para receipt-parser, que solo pide los que conoce).
+
+    **Entrada:** el archivo viaja en multipart. Claim Check aplica al broker, no a este salto: receipt-parser
+    ya tiene los bytes en memoria (los analizó con Tika), así que no hay segunda descarga ni cliente de storage
+    acá.
+
+    **Errores:** siempre `application/problem+json` (RFC 9457) con las extensiones `code` y `retryable`.
+    `retryable` es la clasificación que manda: receipt-parser la usa antes que la clase del status. Sin
+    `retryable` (p. ej. un 5xx de un proxy), 4xx = no reintentable y 5xx = reintentable.
+
+    **Contexto:** acepta `traceparent` y `baggage` (W3C; `correlationId` y `userId` como entradas de baggage,
+    ADR-012) y `X-Correlation-Id`, que manda tracker-common-logger mientras no propague baggage (ACT-08). Con
+    los dos, gana el baggage. Responde siempre `X-Correlation-Id` y `X-Trace-Id`.
+  license:
+    name: Privado
+    identifier: LicenseRef-Proprietary
+servers:
+  - url: http://localhost:8084
+    description: Desarrollo local (puerto objetivo; publicado solo en 127.0.0.1). El servicio todavía no existe, no hay puerto actual.
+  - url: http://ocr-service:8084
+    description: Red interna de Docker Compose / Service de K8s (ADR-001)
+security: []
+tags:
+  - name: extractions
+    description: Transcripción de un archivo
+  - name: engines
+    description: Motores disponibles
+  - name: health
+    description: Liveness y readiness (fuera de /api, sin versión)
+
+paths:
+  /api/v1/ocr/extractions:
+    post:
+      tags: [extractions]
+      operationId: createExtraction
+      summary: Transcribe una imagen o un PDF
+      description: |
+        Preprocesa (rasterizado de PDF y EXIF; orientación de documento y corrección de deformación solo si
+        están habilitadas, apagadas por defecto), corre el motor y reconstruye `layoutText`. Inferencia acotada a `OCR_MAX_CONCURRENCY` en curso más `OCR_MAX_QUEUE` en espera;
+        si la cola está llena responde 503 `OVERLOADED` sin esperar.
+      parameters:
+        - $ref: '#/components/parameters/Traceparent'
+        - $ref: '#/components/parameters/Baggage'
+        - $ref: '#/components/parameters/CorrelationIdHeader'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/ExtractionRequest'
+            encoding:
+              file:
+                contentType: image/png, image/jpeg, application/pdf
+      responses:
+        '200':
+          description: Transcripción. Una imagen sin texto legible no es un error, vuelve con `lines` vacío y `layoutText` vacío.
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OcrResult'
+              examples:
+                paddleocr:
+                  $ref: '#/components/examples/PaddleOcrResult'
+        '400':
+          description: |
+            Request inválido: falta la parte `file` (`INVALID_REQUEST`), motor inexistente (`UNKNOWN_ENGINE`) o
+            no habilitado en `OCR_ENABLED_ENGINES` (`ENGINE_DISABLED`). No reintentable; para receipt-parser
+            delata un bug de contrato o de configuración.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+              examples:
+                unknownEngine:
+                  $ref: '#/components/examples/UnknownEngineProblem'
+        '413':
+          description: Archivo de más de 10 MB (`PAYLOAD_TOO_LARGE`). No reintentable.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+        '415':
+          description: |
+            Tipo no soportado, detectado por los bytes y no por el content type declarado
+            (`UNSUPPORTED_MEDIA_TYPE`). No reintentable.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+        '422':
+          description: |
+            El archivo tiene un tipo soportado pero no se puede procesar: corrupto o truncado (`CORRUPT_FILE`), PDF
+            cifrado (`ENCRYPTED_PDF`) o imagen fuera de límites de tamaño en píxeles (`IMAGE_OUT_OF_BOUNDS`). No
+            reintentable: receipt-parser responde UNPROCESSABLE.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+              examples:
+                corrupt:
+                  $ref: '#/components/examples/CorruptFileProblem'
+        '500':
+          description: Error inesperado (`INTERNAL_ERROR`). Reintentable.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+        '503':
+          description: |
+            Reintentable. Modelos todavía cargando (`ENGINE_NOT_READY`) o cola de inferencia llena (`OVERLOADED`).
+            Para receipt-parser es indisponibilidad: dispara su fallback de transcripción (ADR-021).
+          headers:
+            Retry-After:
+              description: Segundos sugeridos antes de reintentar.
+              schema:
+                type: integer
+                minimum: 1
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+              examples:
+                overloaded:
+                  $ref: '#/components/examples/OverloadedProblem'
+        '504':
+          description: |
+            La inferencia superó `OCR_INFERENCE_TIMEOUT` (`ENGINE_TIMEOUT`), que es menor que el read timeout del
+            cliente para que receipt-parser reciba un error clasificado. Reintentable.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+
+  /api/v1/engines:
+    get:
+      tags: [engines]
+      operationId: listEngines
+      summary: Motores con versión, configHash y estado
+      description: |
+        `engineVersion` y `configHash` forman, con los bytes del archivo, la clave de la caché del eval
+        (ADR-020): el runner y receipt-parser la calculan sin transcribir.
+      parameters:
+        - $ref: '#/components/parameters/CorrelationIdHeader'
+      responses:
+        '200':
+          description: Motores conocidos
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EngineList'
+
+  /health/live:
+    get:
+      tags: [health]
+      operationId: liveness
+      summary: El proceso responde
+      responses:
+        '200':
+          description: Vivo
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+  /health/ready:
+    get:
+      tags: [health]
+      operationId: readiness
+      summary: Listo para transcribir
+      description: |
+        UP cuando terminaron de cargar los modelos de los motores habilitados y los de las etapas del
+        Preprocessor que estén prendidas. No depende de ningún servicio externo.
+      responses:
+        '200':
+          description: Listo
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+        '503':
+          description: Todavía cargando modelos, o falló la carga
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        **No se aplica hoy** (`security: []`): ocr-service se protege por aislamiento de red (127.0.0.1 en dev,
+        NetworkPolicy en K8s) porque su único llamador es receipt-parser, que no hace llamadas en nombre de un
+        usuario web. Si aparece otro llamador, el esquema previsto es un JWT M2M de Keycloak por Client
+        Credentials (como expense-manager → expense-ledger, ADR-005), nunca el JWT de usuario relayado por el
+        Gateway: este servicio no está detrás del Gateway.
+
+  parameters:
+    Traceparent:
+      name: traceparent
+      in: header
+      required: false
+      description: W3C Trace Context.
+      schema:
+        type: string
+        pattern: '^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$'
+      example: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+    Baggage:
+      name: baggage
+      in: header
+      required: false
+      description: W3C Baggage con `correlationId` y `userId` (ADR-012). Llegan a los logs con esos nombres.
+      schema:
+        type: string
+      example: correlationId=7d1c2a9e-0b7f-4c1e-9a55-3f0f6d2b8c41,userId=f3a1b2c4-5d6e-7f80-91a2-b3c4d5e6f708
+    CorrelationIdHeader:
+      name: X-Correlation-Id
+      in: header
+      required: false
+      description: Lo agrega tracker-common-logger en todo RestClient. Si falta junto con el baggage, se usa el traceId.
+      schema:
+        type: string
+        maxLength: 128
+
+  headers:
+    XCorrelationId:
+      description: correlationId efectivo del request.
+      schema:
+        type: string
+    XTraceId:
+      description: traceId del span de servidor.
+      schema:
+        type: string
+        pattern: '^[0-9a-f]{32}$'
+
+  schemas:
+    EngineName:
+      type: string
+      enum: [paddleocr]
+      description: |
+        `paddleocr`: PaddleOCR 3.x con PP-OCRv6, local, con confianza y bbox por línea. Un motor futuro puede no
+        dar confianza ni bbox (`providesConfidence`, `providesBbox`).
+
+    ExtractionRequest:
+      type: object
+      required: [file]
+      properties:
+        file:
+          type: string
+          contentMediaType: application/octet-stream
+          description: PNG, JPEG o PDF, hasta 10 MB. PDF de hasta `OCR_MAX_PDF_PAGES` páginas procesadas (las demás se ignoran y `truncated` = true).
+        engine:
+          $ref: '#/components/schemas/EngineName'
+          description: Motor para este request; sin él, `OCR_ENGINE`. Tiene que estar en `OCR_ENABLED_ENGINES`.
+
+    OcrResult:
+      type: object
+      required: [engine, engineVersion, configHash, model, durationMs, meanConfidence, pageCount, truncated, pages, layoutText]
+      properties:
+        engine:
+          $ref: '#/components/schemas/EngineName'
+        engineVersion:
+          type: string
+          description: Versión de la librería y de los modelos.
+          examples: ['paddleocr 3.x.y; PP-OCRv6 det + rec']
+        configHash:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: |
+            SHA-256 de la configuración efectiva que cambia la salida: flags del Preprocessor
+            (use_doc_orientation_classify, use_doc_unwarping, use_textline_orientation), umbrales, DPI, modelos.
+        model:
+          type: string
+          description: Nombre del modelo, igual al tag `model.name` de las métricas (ADR-022).
+          examples: [PP-OCRv6]
+        durationMs:
+          type: integer
+          minimum: 0
+          description: Tiempo del lado del servidor, incluida la espera en la cola de inferencia.
+        meanConfidence:
+          type: ['number', 'null']
+          minimum: 0
+          maximum: 1
+          description: Media de `confidence` de las líneas ponderada por caracteres; null si el motor no da confianza o si no hay líneas.
+        pageCount:
+          type: integer
+          minimum: 1
+          description: Páginas del archivo de entrada (1 para una imagen).
+        truncated:
+          type: boolean
+          description: true si el PDF tenía más páginas que `OCR_MAX_PDF_PAGES`.
+        pages:
+          type: array
+          items:
+            $ref: '#/components/schemas/Page'
+        layoutText:
+          type: string
+          description: |
+            Texto listo para el LLM. Con bbox: líneas agrupadas por coordenada Y (centro vertical a menos de media
+            altura de línea mediana) y ordenadas por X, con etiqueta y valor en el mismo renglón; páginas separadas
+            por una línea en blanco. Sin bbox: el texto del motor normalizado (espacios y saltos).
+
+    Page:
+      type: object
+      required: [number, width, height, rotation, lines]
+      properties:
+        number:
+          type: integer
+          minimum: 1
+        width:
+          type: integer
+          minimum: 1
+          description: Ancho en píxeles de la imagen ya preprocesada (las bbox se expresan sobre ella).
+        height:
+          type: integer
+          minimum: 1
+        rotation:
+          type: integer
+          enum: [0, 90, 180, 270]
+          description: Rotación aplicada por EXIF y, si está prendido, por el clasificador de orientación de documento.
+        lines:
+          type: array
+          items:
+            $ref: '#/components/schemas/Line'
+
+    Line:
+      type: object
+      required: [text, confidence, bbox]
+      properties:
+        text:
+          type: string
+        confidence:
+          type: ['number', 'null']
+          minimum: 0
+          maximum: 1
+        bbox:
+          oneOf:
+            - $ref: '#/components/schemas/BBox'
+            - type: 'null'
+
+    BBox:
+      type: array
+      description: Rectángulo alineado a los ejes [xMin, yMin, xMax, yMax] en píxeles de la página preprocesada.
+      items:
+        type: integer
+        minimum: 0
+      minItems: 4
+      maxItems: 4
+
+    EngineList:
+      type: object
+      required: [defaultEngine, engines]
+      properties:
+        defaultEngine:
+          $ref: '#/components/schemas/EngineName'
+        engines:
+          type: array
+          items:
+            $ref: '#/components/schemas/EngineInfo'
+
+    EngineInfo:
+      type: object
+      required: [name, enabled, ready, engineVersion, configHash, model, providesConfidence, providesBbox]
+      properties:
+        name:
+          $ref: '#/components/schemas/EngineName'
+        enabled:
+          type: boolean
+          description: Está en `OCR_ENABLED_ENGINES`.
+        ready:
+          type: boolean
+          description: Modelos cargados.
+        engineVersion:
+          type: string
+        model:
+          type: string
+          description: Igual que `OcrResult.model`.
+        configHash:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        providesConfidence:
+          type: boolean
+        providesBbox:
+          type: boolean
+
+    HealthStatus:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [UP, DOWN]
+        engines:
+          type: object
+          additionalProperties:
+            type: string
+            enum: [UP, DOWN, LOADING, DISABLED]
+
+    ProblemDetail:
+      type: object
+      description: RFC 9457 con extensiones.
+      required: [type, title, status, code, retryable]
+      properties:
+        type:
+          type: string
+          format: uri
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        instance:
+          type: string
+          format: uri-reference
+        code:
+          $ref: '#/components/schemas/ErrorCode'
+        retryable:
+          type: boolean
+          description: Clasificación explícita para el retry de Spring AMQP en receipt-parser.
+        engine:
+          $ref: '#/components/schemas/EngineName'
+
+    ErrorCode:
+      type: string
+      description: |
+        Cada código tiene un solo status y una sola clasificación:
+        INVALID_REQUEST, UNKNOWN_ENGINE, ENGINE_DISABLED (400, no reintentable);
+        PAYLOAD_TOO_LARGE (413, no); UNSUPPORTED_MEDIA_TYPE (415, no);
+        CORRUPT_FILE, ENCRYPTED_PDF, IMAGE_OUT_OF_BOUNDS (422, no);
+        INTERNAL_ERROR (500, sí); ENGINE_NOT_READY, OVERLOADED (503, sí); ENGINE_TIMEOUT (504, sí).
+      enum:
+        - INVALID_REQUEST
+        - UNKNOWN_ENGINE
+        - ENGINE_DISABLED
+        - PAYLOAD_TOO_LARGE
+        - UNSUPPORTED_MEDIA_TYPE
+        - CORRUPT_FILE
+        - ENCRYPTED_PDF
+        - IMAGE_OUT_OF_BOUNDS
+        - INTERNAL_ERROR
+        - ENGINE_NOT_READY
+        - OVERLOADED
+        - ENGINE_TIMEOUT
+
+  examples:
+    PaddleOcrResult:
+      summary: Captura de transferencia (datos ficticios)
+      value:
+        engine: paddleocr
+        engineVersion: 'paddleocr 3.x.y; PP-OCRv6 det + rec'
+        configHash: 3f5a0c1e9b7d4a2f8e6c5b4a3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e
+        model: PP-OCRv6
+        durationMs: 4210
+        meanConfidence: 0.94
+        pageCount: 1
+        truncated: false
+        pages:
+          - number: 1
+            width: 1080
+            height: 1920
+            rotation: 0
+            lines:
+              - text: Transferencia enviada
+                confidence: 0.99
+                bbox: [120, 210, 640, 262]
+              - text: Monto
+                confidence: 0.98
+                bbox: [80, 420, 230, 460]
+              - text: '$ 1.234,56'
+                confidence: 0.95
+                bbox: [700, 418, 1000, 466]
+        layoutText: "Transferencia enviada\nMonto  $ 1.234,56"
+    UnknownEngineProblem:
+      value:
+        type: https://expense-tracker.local/problems/unknown-engine
+        title: Unknown OCR engine
+        status: 400
+        detail: 'Engine tesseract is not one of: paddleocr.'
+        code: UNKNOWN_ENGINE
+        retryable: false
+    CorruptFileProblem:
+      value:
+        type: https://expense-tracker.local/problems/corrupt-file
+        title: Corrupt file
+        status: 422
+        detail: The JPEG stream ends before the image data.
+        code: CORRUPT_FILE
+        retryable: false
+        engine: paddleocr
+    OverloadedProblem:
+      value:
+        type: https://expense-tracker.local/problems/overloaded
+        title: OCR overloaded
+        status: 503
+        detail: Inference queue is full.
+        code: OVERLOADED
+        retryable: true
+        engine: paddleocr

@@ -21,8 +21,10 @@ from ocr_service.settings import Settings
 
 from .conftest import FakeEngine, Obs, jpeg_bytes, pdf_bytes, png_bytes, wait_until
 
-# el contrato vive en el harness, dos niveles arriba de este repo (revisar cuando el repo tenga CI propio)
-CONTRACT = Path(__file__).resolve().parents[1] / "../../contracts/openapi/ocr-service-api.yaml"
+# copia versionada del contrato del harness (el harness no tiene remoto y el CI no lo ve)
+CONTRACT = Path(__file__).resolve().parents[1] / "contracts/openapi/ocr-service-api.yaml"
+# fuente de verdad: existe solo con el repo clonado en repos/ del harness
+HARNESS_CONTRACT = Path(__file__).resolve().parents[3] / "contracts/openapi/ocr-service-api.yaml"
 # bytes válidos por tipo: con relleno al azar nunca se llegaría al 200
 for media_type, sample in (("image/png", png_bytes()), ("image/jpeg", jpeg_bytes()), ("application/pdf", pdf_bytes())):
     schemathesis.openapi.media_type(media_type, st.just(sample))
@@ -51,6 +53,13 @@ schema = schemathesis.pytest.from_fixture("api_schema")
 @settings(max_examples=40, deadline=None, suppress_health_check=list(HealthCheck))
 def test_app_conforms_to_contract(case: Any) -> None:
     case.call_and_validate(checks=CHECKS)
+
+
+@pytest.mark.skipif(not HARNESS_CONTRACT.is_file(), reason="fuera del harness: no hay contra qué comparar")
+def test_contract_copy_matches_harness() -> None:
+    assert CONTRACT.read_bytes() == HARNESS_CONTRACT.read_bytes(), (
+        f"contracts/openapi/ocr-service-api.yaml quedó desfasado: copiar {HARNESS_CONTRACT}"
+    )
 
 
 def contract() -> dict[str, Any]:

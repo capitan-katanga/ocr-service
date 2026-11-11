@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_VERSION: "0.13.7" # el mismo de la imagen builder del Dockerfile
+
+jobs:
+  checks:
+    name: ruff, mypy, pytest
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # antes de uv sync: escanea uv.lock, no el .venv
+      - name: Trivy (uv.lock)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: uv.lock
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      - run: uv sync --frozen
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy
+      # incluye Schemathesis sobre contracts/openapi/ del repo; test_contract_copy_matches_harness se saltea (sin harness)
+      - run: uv run pytest -q --cov --cov-report=xml --cov-fail-under=90
+
+  image:
+    name: imagen, readiness offline, Trivy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          tags: ocr-service:local
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      # los modelos van en la imagen: sin red tiene que llegar a healthy y no intentar descargas
+      - name: Readiness con --network none
+        run: |
+          docker run -d --network none --name ocr ocr-service:local
+          status=starting
+          for _ in $(seq 1 60); do
+            status=$(docker inspect -f '{{.State.Health.Status}}' ocr)
+            [ "$status" = healthy ] || [ "$status" = unhealthy ] && break
+            [ "$(docker inspect -f '{{.State.Running}}' ocr)" = true ] || break
+            sleep 5
+          done
+          docker logs ocr > ocr.log 2>&1
+          cat ocr.log
+          docker rm -f ocr
+          [ "$status" = healthy ] || { echo "::error::estado final: $status"; exit 1; }
+          if grep -E 'Downloading|Connecting to|Max retries|huggingface|bcebos|modelscope|aistudio' ocr.log; then
+            echo "::error::intento de descarga con la red cortada"; exit 1
+          fi
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      - name: Tests contra la imagen (slow)
+        run: uv sync --frozen && uv run pytest -q -m slow
+      - name: Trivy (imagen)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ocr-service:local
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"

@@ -19,7 +19,13 @@ ENV PATH="/app/.venv/bin:$PATH" OCR_MODELS_DIR=/models
 RUN python /tmp/fetch_models.py
 
 FROM base AS runtime
-RUN useradd --system --create-home --uid 10001 ocr
+# para Trivy: parches de seguridad de Debian y sin el pip del sistema, que vendoriza urllib3, msgpack y setuptools
+# viejos (la app corre desde /app/.venv y no lo usa)
+RUN apt-get update \
+    && apt-get upgrade -y --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/* \
+    && python -m pip uninstall -y pip \
+    && useradd --system --create-home --uid 10001 ocr
 COPY --from=builder /app/.venv /app/.venv
 COPY --from=models /models /models
 ENV PATH="/app/.venv/bin:$PATH" \
